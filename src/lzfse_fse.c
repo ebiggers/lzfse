@@ -32,6 +32,16 @@ static int compare_counts(const void *a, const void *b) {
   return 0;
 }
 
+static inline unsigned get_state_generator(unsigned nstates) {
+	return (nstates >> 1) | (nstates >> 3) | 3;
+}
+
+static inline unsigned ilog2_ceil(uint32_t n) {
+	if (n <= 1)
+		return 0;
+	return 32 - __builtin_clz(n - 1);
+}
+
 // Initialize encoder table T[NSYMBOLS].
 // NSTATES = sum FREQ[i] is the number of states (a power of 2)
 // NSYMBOLS is the number of symbols.
@@ -39,22 +49,55 @@ static int compare_counts(const void *a, const void *b) {
 // >= 0.
 // Some symbols may have a 0 frequency.  In that case, they should not be
 // present in the data.
-void fse_init_encoder_table(int nstates, int nsymbols,
-                            const uint16_t *__restrict freq,
-                            fse_encoder_entry *__restrict t) {
-  int offset = 0; // current offset
-  int n_clz = __builtin_clz(nstates);
-  for (int i = 0; i < nsymbols; i++) {
-    int f = (int)freq[i];
-    if (f == 0)
-      continue; // skip this symbol, no occurrences
-    int k =
-        __builtin_clz(f) - n_clz; // shift needed to ensure N <= (F<<K) < 2*N
-    t[i].s0 = (int16_t)((f << k) - nstates);
-    t[i].k = (int16_t)k;
-    t[i].delta0 = (int16_t)(offset - f + (nstates >> k));
-    t[i].delta1 = (int16_t)(offset - f + (nstates >> (k - 1)));
-    offset += f;
+void fse_init_encoder_table(int num_states, int alphabet_size,
+                            const uint16_t *__restrict state_counts,
+                            fse_encoder_entry *__restrict sym_encinfo,
+                            uint16_t *__restrict next_statesx) {
+  const int log2_num_states = 31 - __builtin_clz(num_states);
+  const unsigned state_generator = get_state_generator(num_states);
+  const unsigned state_mask = num_states - 1;
+  unsigned cumul_total;
+  unsigned sym;
+  unsigned state;
+  unsigned count;
+  unsigned max_bits;
+  uint16_t cumul_state_counts[alphabet_size];
+  uint8_t state_to_symbol[num_states];
+
+  cumul_total = 0;
+  for (sym = 0; sym < alphabet_size; sym++) {
+
+    count = state_counts[sym];
+
+    if (count == 0) /* Unused symbol? */
+      continue;
+
+    cumul_state_counts[sym] = cumul_total;
+
+    max_bits = log2_num_states - ilog2_ceil(count) + 1;
+
+    sym_encinfo[sym].adjusted_num_states_in_big_ranges =
+      ((uint32_t)max_bits << 16) -
+      ((uint32_t)count << max_bits);
+
+    sym_encinfo[sym].next_states_begin = (int32_t)cumul_total - (int32_t)count;
+
+    cumul_total += count;
+  }
+
+  state = 0;
+  for (sym = 0; sym < alphabet_size; sym++) {
+    count = state_counts[sym];
+    while (count--) {
+      state_to_symbol[state] = sym;
+      state = (state + state_generator) & state_mask;
+    }
+  }
+
+  for (state = 0; state < num_states; state++) {
+    unsigned symbol = state_to_symbol[state];
+    unsigned position = cumul_state_counts[symbol]++;
+    next_statesx[position] = num_states + state;
   }
 }
 
@@ -66,46 +109,42 @@ void fse_init_encoder_table(int nstates, int nsymbols,
 // Some symbols may have a 0 frequency.  In that case, they should not be
 // present in the data.
 int fse_init_decoder_table(int nstates, int nsymbols,
-                           const uint16_t *__restrict freq,
+                           uint16_t *__restrict freq,
                            int32_t *__restrict t) {
-  assert(nsymbols <= 256);
-  assert(fse_check_freq(freq, nsymbols, nstates) == 0);
-  int n_clz = __builtin_clz(nstates);
-  int sum_of_freq = 0;
-  for (int i = 0; i < nsymbols; i++) {
-    int f = (int)freq[i];
-    if (f == 0)
-      continue; // skip this symbol, no occurrences
+  fse_decoder_entry *decode_table = (fse_decoder_entry *)t;
+  const int log2_num_states =  31 - __builtin_clz(nstates);
+  const unsigned state_generator = get_state_generator(nstates);
+  const unsigned state_mask = nstates - 1;
+  unsigned state = 0;
+  uint32_t total_count = 0;
+  unsigned sym;
 
-    sum_of_freq += f;
-
-    if (sum_of_freq > nstates) {
-      return -1;
-    }
-
-    int k =
-        __builtin_clz(f) - n_clz; // shift needed to ensure N <= (F<<K) < 2*N
-    int j0 = ((2 * nstates) >> k) - f;
-
-    // Initialize all states S reached by this symbol: OFFSET <= S < OFFSET + F
-    for (int j = 0; j < f; j++) {
-      fse_decoder_entry e;
-
-      e.symbol = (uint8_t)i;
-      if (j < j0) {
-        e.k = (int8_t)k;
-        e.delta = (int16_t)(((f + j) << k) - nstates);
-      } else {
-        e.k = (int8_t)(k - 1);
-        e.delta = (int16_t)((j - j0) << (k - 1));
-      }
-
-      memcpy(t, &e, sizeof(e));
-      t++;
-    }
+  for (sym = 0; sym < nsymbols; sym++) {
+    unsigned count = freq[sym];
+    if (count == 0)
+      continue;
+    total_count += count;
+    do {
+      decode_table[state].symbol = sym;
+      state = (state + state_generator) & state_mask;
+    } while (--count);
   }
 
-  return 0; // OK
+  if (total_count != nstates)
+	  return 0;
+
+  for (state = 0; state < nstates; state++) {
+
+    uint8_t sym = decode_table[state].symbol;
+    uint32_t counter = freq[sym]++;
+    unsigned num_bits = log2_num_states - (31 - __builtin_clz(counter));
+    uint32_t destination_range_start = (counter << num_bits) - nstates;
+
+    decode_table[state].k = num_bits;
+    decode_table[state].delta = destination_range_start;
+  }
+
+  return 1;
 }
 
 // Initialize value decoder table T[NSTATES].
@@ -118,42 +157,44 @@ int fse_init_decoder_table(int nstates, int nsymbols,
 // Some symbols may have a 0 frequency.  In that case, they should not be
 // present in the data.
 void fse_init_value_decoder_table(int nstates, int nsymbols,
-                                  const uint16_t *__restrict freq,
+                                  uint16_t *__restrict freq,
                                   const uint8_t *__restrict symbol_vbits,
                                   const int32_t *__restrict symbol_vbase,
                                   fse_value_decoder_entry *__restrict t) {
-  assert(nsymbols <= 256);
-  assert(fse_check_freq(freq, nsymbols, nstates) == 0);
 
-  int n_clz = __builtin_clz(nstates);
-  for (int i = 0; i < nsymbols; i++) {
-    int f = (int)freq[i];
-    if (f == 0)
-      continue; // skip this symbol, no occurrences
+  fse_value_decoder_entry *decode_table = t;
+  const int log2_num_states =  31 - __builtin_clz(nstates);
+  const unsigned state_generator = get_state_generator(nstates);
+  const unsigned state_mask = nstates - 1;
+  unsigned state = 0;
+  uint32_t total_count = 0;
+  unsigned sym;
 
-    int k =
-        __builtin_clz(f) - n_clz; // shift needed to ensure N <= (F<<K) < 2*N
-    int j0 = ((2 * nstates) >> k) - f;
+  for (sym = 0; sym < nsymbols; sym++) {
+    unsigned count = freq[sym];
+    if (count == 0)
+      continue;
+    total_count += count;
+    do {
+      decode_table[state].total_bits = sym; // temporary
+      state = (state + state_generator) & state_mask;
+    } while (--count);
+  }
 
-    fse_value_decoder_entry ei = {0};
-    ei.value_bits = symbol_vbits[i];
-    ei.vbase = symbol_vbase[i];
+  if (total_count != nstates)
+	  return; // TODO
 
-    // Initialize all states S reached by this symbol: OFFSET <= S < OFFSET + F
-    for (int j = 0; j < f; j++) {
-      fse_value_decoder_entry e = ei;
+  for (state = 0; state < nstates; state++) {
 
-      if (j < j0) {
-        e.total_bits = (uint8_t)k + e.value_bits;
-        e.delta = (int16_t)(((f + j) << k) - nstates);
-      } else {
-        e.total_bits = (uint8_t)(k - 1) + e.value_bits;
-        e.delta = (int16_t)((j - j0) << (k - 1));
-      }
+    uint8_t sym = decode_table[state].total_bits;
+    uint32_t counter = freq[sym]++;
+    unsigned num_bits = log2_num_states - (31 - __builtin_clz(counter));
+    uint32_t destination_range_start = (counter << num_bits) - nstates;
 
-      memcpy(t, &e, 8);
-      t++;
-    }
+    decode_table[state].total_bits = symbol_vbits[sym] + num_bits;
+    decode_table[state].value_bits = symbol_vbits[sym];
+    decode_table[state].delta = destination_range_start;
+    decode_table[state].vbase = symbol_vbase[sym];
   }
 }
 

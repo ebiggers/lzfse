@@ -180,6 +180,12 @@ static int lzfse_encode_matches(lzfse_encoder_state *s) {
   fse_encoder_entry m_encoder[LZFSE_ENCODE_M_SYMBOLS];
   fse_encoder_entry d_encoder[LZFSE_ENCODE_D_SYMBOLS];
   fse_encoder_entry literal_encoder[LZFSE_ENCODE_LITERAL_SYMBOLS];
+
+  uint16_t l_next_statesx[LZFSE_ENCODE_L_STATES];
+  uint16_t m_next_statesx[LZFSE_ENCODE_M_STATES];
+  uint16_t d_next_statesx[LZFSE_ENCODE_D_STATES];
+  uint16_t literal_next_statesx[LZFSE_ENCODE_LITERAL_STATES];
+
   int ok = 1;
   lzfse_compressed_block_header_v1 header1 = {0};
   lzfse_compressed_block_header_v2 *header2 = 0;
@@ -269,21 +275,21 @@ static int lzfse_encode_matches(lzfse_encoder_state *s) {
 
   // Initialize encoder tables from freq tables
   fse_init_encoder_table(LZFSE_ENCODE_L_STATES, LZFSE_ENCODE_L_SYMBOLS,
-                         header1.l_freq, l_encoder);
+                         header1.l_freq, l_encoder, l_next_statesx);
   fse_init_encoder_table(LZFSE_ENCODE_M_STATES, LZFSE_ENCODE_M_SYMBOLS,
-                         header1.m_freq, m_encoder);
+                         header1.m_freq, m_encoder, m_next_statesx);
   fse_init_encoder_table(LZFSE_ENCODE_D_STATES, LZFSE_ENCODE_D_SYMBOLS,
-                         header1.d_freq, d_encoder);
+                         header1.d_freq, d_encoder, d_next_statesx);
   fse_init_encoder_table(LZFSE_ENCODE_LITERAL_STATES,
                          LZFSE_ENCODE_LITERAL_SYMBOLS, header1.literal_freq,
-                         literal_encoder);
+                         literal_encoder, literal_next_statesx);
 
   // Encode literals
   {
     fse_out_stream out;
     fse_out_init(&out);
     fse_state state0, state1, state2, state3;
-    state0 = state1 = state2 = state3 = 0;
+    state0 = state1 = state2 = state3 = LZFSE_ENCODE_LITERAL_STATES;
 
     uint8_t *buf = s->dst;
     uint32_t i = s->n_literals; // I multiple of 4
@@ -295,13 +301,13 @@ static int lzfse_encode_matches(lzfse_encoder_state *s) {
         goto END;
       } // out full
       i -= 4;
-      fse_encode(&state3, literal_encoder, &out, s->literals[i + 3]); // 10b
-      fse_encode(&state2, literal_encoder, &out, s->literals[i + 2]); // 10b
+      fse_encode(&state3, literal_encoder, literal_next_statesx, &out, s->literals[i + 3]); // 10b
+      fse_encode(&state2, literal_encoder, literal_next_statesx, &out, s->literals[i + 2]); // 10b
 #if !FSE_IOSTREAM_64
       fse_out_flush(&out, &buf);
 #endif
-      fse_encode(&state1, literal_encoder, &out, s->literals[i + 1]); // 10b
-      fse_encode(&state0, literal_encoder, &out, s->literals[i + 0]); // 10b
+      fse_encode(&state1, literal_encoder, literal_next_statesx, &out, s->literals[i + 1]); // 10b
+      fse_encode(&state0, literal_encoder, literal_next_statesx, &out, s->literals[i + 0]); // 10b
       fse_out_flush(&out, &buf);
     }
     fse_out_finish(&out, &buf);
@@ -309,10 +315,10 @@ static int lzfse_encode_matches(lzfse_encoder_state *s) {
     // Update header with final encoder state
     header1.literal_bits = out.accum_nbits; // [-7, 0]
     header1.n_literal_payload_bytes = (uint32_t)(buf - s->dst);
-    header1.literal_state[0] = state0;
-    header1.literal_state[1] = state1;
-    header1.literal_state[2] = state2;
-    header1.literal_state[3] = state3;
+    header1.literal_state[0] = state0 - LZFSE_ENCODE_LITERAL_STATES;
+    header1.literal_state[1] = state1 - LZFSE_ENCODE_LITERAL_STATES;
+    header1.literal_state[2] = state2 - LZFSE_ENCODE_LITERAL_STATES;
+    header1.literal_state[3] = state3 - LZFSE_ENCODE_LITERAL_STATES;
 
     // Update state
     s->dst = buf;
@@ -323,8 +329,9 @@ static int lzfse_encode_matches(lzfse_encoder_state *s) {
   {
     fse_out_stream out;
     fse_out_init(&out);
-    fse_state l_state, m_state, d_state;
-    l_state = m_state = d_state = 0;
+    fse_state l_state = LZFSE_ENCODE_L_STATES;
+    fse_state m_state = LZFSE_ENCODE_M_STATES;
+    fse_state d_state = LZFSE_ENCODE_D_STATES;
 
     uint8_t *buf = s->dst;
     uint32_t i = s->n_matches;
@@ -352,7 +359,7 @@ static int lzfse_encode_matches(lzfse_encoder_state *s) {
       int32_t d_nbits = d_extra_bits[d_symbol];
       int32_t d_bits = d_value - d_base_value[d_symbol];
       fse_out_push(&out, d_nbits, d_bits);
-      fse_encode(&d_state, d_encoder, &out, d_symbol);
+      fse_encode(&d_state, d_encoder, d_next_statesx, &out, d_symbol);
 #if !FSE_IOSTREAM_64
       fse_out_flush(&out, &buf);
 #endif
@@ -363,7 +370,7 @@ static int lzfse_encode_matches(lzfse_encoder_state *s) {
       int32_t m_nbits = m_extra_bits[m_symbol];
       int32_t m_bits = m_value - m_base_value[m_symbol];
       fse_out_push(&out, m_nbits, m_bits);
-      fse_encode(&m_state, m_encoder, &out, m_symbol);
+      fse_encode(&m_state, m_encoder, m_next_statesx, &out, m_symbol);
 #if !FSE_IOSTREAM_64
       fse_out_flush(&out, &buf);
 #endif
@@ -374,7 +381,7 @@ static int lzfse_encode_matches(lzfse_encoder_state *s) {
       int32_t l_nbits = l_extra_bits[l_symbol];
       int32_t l_bits = l_value - l_base_value[l_symbol];
       fse_out_push(&out, l_nbits, l_bits);
-      fse_encode(&l_state, l_encoder, &out, l_symbol);
+      fse_encode(&l_state, l_encoder, l_next_statesx, &out, l_symbol);
       fse_out_flush(&out, &buf);
     }
     fse_out_finish(&out, &buf);
@@ -382,9 +389,9 @@ static int lzfse_encode_matches(lzfse_encoder_state *s) {
     // Update header with final encoder state
     header1.n_lmd_payload_bytes = (uint32_t)(buf - s->dst);
     header1.lmd_bits = out.accum_nbits; // [-7, 0]
-    header1.l_state = l_state;
-    header1.m_state = m_state;
-    header1.d_state = d_state;
+    header1.l_state = l_state - LZFSE_ENCODE_L_STATES;
+    header1.m_state = m_state - LZFSE_ENCODE_M_STATES;
+    header1.d_state = d_state - LZFSE_ENCODE_D_STATES;
 
     // Update state
     s->dst = buf;

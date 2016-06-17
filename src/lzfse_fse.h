@@ -456,11 +456,8 @@ typedef fse_in_stream32 fse_in_stream;
 
 /*! @abstract Entry for one symbol in the encoder table (64b). */
 typedef struct {
-  int16_t s0;     // First state requiring a K-bit shift
-  int16_t k;      // States S >= S0 are shifted K bits. States S < S0 are
-                  // shifted K-1 bits
-  int16_t delta0; // Relative increment used to compute next state if S >= S0
-  int16_t delta1; // Relative increment used to compute next state if S < S0
+  uint32_t adjusted_num_states_in_big_ranges;
+  int32_t next_states_begin;
 } fse_encoder_entry;
 
 /*! @abstract  Entry for one state in the decoder table (32b). */
@@ -483,26 +480,20 @@ typedef struct {      // DO NOT REORDER THE FIELDS
  *  @note The caller must ensure we have enough bits available in the output
  *  stream accumulator. */
 FSE_INLINE void fse_encode(fse_state *__restrict pstate,
-                           const fse_encoder_entry *__restrict encoder_table,
-                           fse_out_stream *__restrict out, uint8_t symbol) {
-  int s = *pstate;
-  fse_encoder_entry e = encoder_table[symbol];
-  int s0 = e.s0;
-  int k = e.k;
-  int delta0 = e.delta0;
-  int delta1 = e.delta1;
+                           const fse_encoder_entry *__restrict sym_encinfo,
+			   const uint16_t *__restrict next_statesx,
+			   fse_out_stream *__restrict out, uint8_t symbol) {
+	unsigned num_bits;
 
-  // Number of bits to write
-  int hi = s >= s0;
-  fse_bit_count nbits = hi ? k : (k - 1);
-  fse_state delta = hi ? delta0 : delta1;
+	num_bits = (sym_encinfo[symbol].adjusted_num_states_in_big_ranges +
+		    *pstate) >> 16;
 
-  // Write lower NBITS of state
-  fse_bits b = fse_mask_lsb(s, nbits);
-  fse_out_push(out, nbits, b);
+	/* Output the appropriate number of bits of the state. */
+	fse_out_push(out, num_bits, fse_mask_lsb(*pstate, num_bits));
 
-  // Update state with remaining bits and delta
-  *pstate = delta + (s >> nbits);
+	/* Look up the next state using the high bits of the current state. */
+	*pstate = next_statesx[sym_encinfo[symbol].next_states_begin +
+		(*pstate >> num_bits)];
 }
 
 /*! @abstract Decode and return symbol using the decoder table, and update
@@ -578,7 +569,8 @@ FSE_INLINE int fse_check_freq(const uint16_t *freq_table,
  */
 void fse_init_encoder_table(int nstates, int nsymbols,
                             const uint16_t *__restrict freq,
-                            fse_encoder_entry *__restrict t);
+                            fse_encoder_entry *__restrict t,
+			    uint16_t *__restrict next_statex);
 
 /*! @abstract Initialize decoder table \c t[nstates].
  *
@@ -597,7 +589,7 @@ void fse_init_encoder_table(int nstates, int nsymbols,
  * @return -1 on failure.
  */
 int fse_init_decoder_table(int nstates, int nsymbols,
-                           const uint16_t *__restrict freq,
+                           uint16_t *__restrict freq,
                            int32_t *__restrict t);
 
 /*! @abstract Initialize value decoder table \c t[nstates].
@@ -616,7 +608,7 @@ int fse_init_decoder_table(int nstates, int nsymbols,
  * present in the data.
  */
 void fse_init_value_decoder_table(int nstates, int nsymbols,
-                                  const uint16_t *__restrict freq,
+                                  uint16_t *__restrict freq,
                                   const uint8_t *__restrict symbol_vbits,
                                   const int32_t *__restrict symbol_vbase,
                                   fse_value_decoder_entry *__restrict t);
